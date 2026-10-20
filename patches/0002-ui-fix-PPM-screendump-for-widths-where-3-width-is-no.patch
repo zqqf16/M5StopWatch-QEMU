@@ -1,0 +1,26 @@
+From 740f03cf0fee3efd61f214bfd51de08891546da6 Mon Sep 17 00:00:00 2001
+From: M5StopWatch-QEMU <m5sw-qemu@local>
+Date: Tue, 20 Oct 2026 11:11:09 +0800
+Subject: [PATCH 2/4] ui: fix PPM screendump for widths where 3*width is not
+ 4-byte aligned
+
+---
+ ui/ui-qmp-cmds.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/ui/ui-qmp-cmds.c b/ui/ui-qmp-cmds.c
+index 74fa6c6..4771696 100644
+--- a/ui/ui-qmp-cmds.c
++++ b/ui/ui-qmp-cmds.c
+@@ -318,7 +318,7 @@ static bool ppm_save(int fd, pixman_image_t *image, Error **errp)
+         qemu_pixman_linebuf_fill(linebuf, image, width, 0, y);
+         if (qio_channel_write_all(QIO_CHANNEL(ioc),
+                                   (char *)pixman_image_get_data(linebuf),
+-                                  pixman_image_get_stride(linebuf), errp) < 0) {
++                                  width * 3, errp) < 0) {
+             return false;
+         }
+     }
+-- 
+2.47.3
+

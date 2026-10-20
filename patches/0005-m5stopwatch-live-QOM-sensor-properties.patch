@@ -1,0 +1,157 @@
+From 99dd82d5cb581dc44bb60e2fc9c78991ae5b2a2a Mon Sep 17 00:00:00 2001
+From: m5sw <m5sw@local>
+Date: Tue, 20 Oct 2026 14:11:50 +0800
+Subject: [PATCH] m5stopwatch: live QOM properties for BMI270 (accel-x/y/z g,
+ gyro-x/y/z dps) and M5PM1 (vbat-mv, vin-mv, vinout-mv, charging); stable
+ /machine/<model> paths
+
+---
+ hw/m5stopwatch/esp32s3_gpspi.c |  2 +
+ hw/m5stopwatch/m5sw_i2c_devs.c | 82 +++++++++++++++++++++++++++++++++-
+ 2 files changed, 82 insertions(+), 2 deletions(-)
+
+diff --git a/hw/m5stopwatch/esp32s3_gpspi.c b/hw/m5stopwatch/esp32s3_gpspi.c
+index 8fcfe4c..418e161 100644
+--- a/hw/m5stopwatch/esp32s3_gpspi.c
++++ b/hw/m5stopwatch/esp32s3_gpspi.c
+@@ -256,6 +256,8 @@ void m5stopwatch_board_init(MemoryRegion *sys_mem, DeviceState *intmatrix,
+         DeviceState *d = qdev_new(TYPE_M5SW_I2C_DEV);
+         qdev_prop_set_string(d, "model", devs[i].model);
+         qdev_prop_set_uint8(d, "address", devs[i].addr);
++        /* stable QOM paths for QMP: /machine/m5pm1, /machine/bmi270, ... */
++        object_property_add_child(qdev_get_machine(), devs[i].model, OBJECT(d));
+         qdev_realize_and_unref(d, (BusState *)bus, &error_fatal);
+     }
+ 
+diff --git a/hw/m5stopwatch/m5sw_i2c_devs.c b/hw/m5stopwatch/m5sw_i2c_devs.c
+index 7ea61ec..1344705 100644
+--- a/hw/m5stopwatch/m5sw_i2c_devs.c
++++ b/hw/m5stopwatch/m5sw_i2c_devs.c
+@@ -11,6 +11,9 @@
+ #include "qapi/error.h"
+ #include "hw/i2c/i2c.h"
+ #include "hw/qdev-properties.h"
++#include "qapi/visitor.h"
++#include <math.h>
++#include "qom/object.h"
+ #include "m5stopwatch.h"
+ 
+ enum { M_GENERIC, M_PM1, M_IOE1, M_CST820, M_BMI270, M_RX8130, M_ES8311 };
+@@ -24,6 +27,11 @@ typedef struct M5swI2CDev {
+     bool ptr_set;          /* first byte of a write = register address */
+     int64_t rtc_offset;    /* seconds added to host time (RX8130) */
+     bool trace;
++    /* live, QOM-settable sensor state (qom-set /machine/bmi270 accel-x 0.5 ...) */
++    double accel[3];       /* g   (BMI270 sensor frame) */
++    double gyro[3];        /* dps */
++    int64_t vbat_mv, vin_mv, vinout_mv; /* M5PM1 */
++    bool charging;         /* M5PM1 G2 CHG_STAT low = charging */
+ } M5swI2CDev;
+ 
+ OBJECT_DECLARE_SIMPLE_TYPE(M5swI2CDev, M5SW_I2C_DEV)
+@@ -105,7 +113,33 @@ static uint8_t dev_read_reg(M5swI2CDev *s, uint8_t r)
+             return b[r];
+         }
+         break;
++    case M_PM1:
++        if (r == 0x12) {                                 /* GPIO_IN: G2 = CHG_STAT (active low) */
++            return (s->regs[0x12] & ~0x04) | (s->charging ? 0 : 0x04);
++        }
++        if (r >= 0x22 && r <= 0x27) {
++            int64_t v = r < 0x24 ? s->vbat_mv : r < 0x26 ? s->vin_mv : s->vinout_mv;
++            v = MAX(0, MIN(v, 65535));
++            return (r & 1) ? (v >> 8) & 0xff : v & 0xff;
++        }
++        break;
+     case M_BMI270:
++        if (r >= 0x0C && r <= 0x17) {                    /* ACC_X..GYR_Z, LSB first */
++            int i = (r - 0x0C) / 2;
++            double v;
++            if (i < 3) {        /* ACC_RANGE[1:0]: 0=2g 1=4g 2=8g 3=16g */
++                v = s->accel[i] * 32768.0 / (2 << (s->regs[0x41] & 3));
++            } else {            /* GYR_RANGE[2:0]: 0=2000 .. 4=125 dps */
++                int gr = s->regs[0x43] & 7;
++                v = s->gyro[i - 3] * 32768.0 / (2000 >> (gr > 4 ? 4 : gr));
++            }
++            int32_t iv = (int32_t)lrint(v);
++            iv = MAX(-32768, MIN(iv, 32767));
++            return ((r - 0x0C) & 1) ? ((uint16_t)iv >> 8) : ((uint16_t)iv & 0xff);
++        }
++        if (r == 0x1D) {                                 /* INT_STATUS_1: acc/gyr drdy */
++            return 0xC0;
++        }
+         if (r == 0x21) {                                 /* INTERNAL_STATUS */
+             return s->regs[0x59] & 1 ? 0x01 : 0x00;      /* init OK after INIT_CTRL=1 */
+         }
+@@ -193,6 +227,40 @@ static int dev_send(I2CSlave *i2c, uint8_t data)
+     return 0;
+ }
+ 
++static void prop_get_num(Object *o, Visitor *v, const char *name, void *op, Error **errp)
++{
++    visit_type_number(v, name, (double *)op, errp);
++}
++static void prop_set_num(Object *o, Visitor *v, const char *name, void *op, Error **errp)
++{
++    double d;
++    if (visit_type_number(v, name, &d, errp)) {
++        *(double *)op = d;
++    }
++}
++static void prop_get_i64(Object *o, Visitor *v, const char *name, void *op, Error **errp)
++{
++    visit_type_int64(v, name, (int64_t *)op, errp);
++}
++static void prop_set_i64(Object *o, Visitor *v, const char *name, void *op, Error **errp)
++{
++    int64_t d;
++    if (visit_type_int64(v, name, &d, errp)) {
++        *(int64_t *)op = d;
++    }
++}
++static void prop_get_bool(Object *o, Visitor *v, const char *name, void *op, Error **errp)
++{
++    visit_type_bool(v, name, (bool *)op, errp);
++}
++static void prop_set_bool(Object *o, Visitor *v, const char *name, void *op, Error **errp)
++{
++    bool d;
++    if (visit_type_bool(v, name, &d, errp)) {
++        *(bool *)op = d;
++    }
++}
++
+ static void dev_realize(DeviceState *dev, Error **errp)
+ {
+     M5swI2CDev *s = M5SW_I2C_DEV(dev);
+@@ -210,6 +278,11 @@ static void dev_realize(DeviceState *dev, Error **errp)
+         s->regs[0x24] = 5000 & 0xff; s->regs[0x25] = 5000 >> 8;   /* VIN 5.0 V (USB) */
+         s->regs[0x26] = 5000 & 0xff; s->regs[0x27] = 5000 >> 8;
+         s->regs[0x12] = 0x04;   /* GPIO_IN: CHG_STAT (G2) high = not charging */
++        s->vbat_mv = 4000; s->vin_mv = 5000; s->vinout_mv = 5000; s->charging = false;
++        object_property_add(OBJECT(s), "vbat-mv", "int", prop_get_i64, prop_set_i64, NULL, &s->vbat_mv);
++        object_property_add(OBJECT(s), "vin-mv", "int", prop_get_i64, prop_set_i64, NULL, &s->vin_mv);
++        object_property_add(OBJECT(s), "vinout-mv", "int", prop_get_i64, prop_set_i64, NULL, &s->vinout_mv);
++        object_property_add(OBJECT(s), "charging", "bool", prop_get_bool, prop_set_bool, NULL, &s->charging);
+         g_pm1 = s;
+     } else if (!strcmp(m, "m5ioe1")) {
+         s->model = M_IOE1;
+@@ -226,8 +299,13 @@ static void dev_realize(DeviceState *dev, Error **errp)
+         s->model = M_BMI270;
+         s->regs[0x00] = 0x24;   /* CHIP_ID */
+         s->regs[0x7C] = 0x03;   /* PWR_CONF default */
+-        /* accel z = +1g at +-8g range (4096 LSB/g) */
+-        s->regs[0x10] = 0x00; s->regs[0x11] = 0x10;
++        s->accel[2] = 1.0;      /* lying flat: +1 g on Z */
++        static const char *an[] = { "accel-x", "accel-y", "accel-z" };
++        static const char *gn[] = { "gyro-x", "gyro-y", "gyro-z" };
++        for (int i = 0; i < 3; i++) {
++            object_property_add(OBJECT(s), an[i], "number", prop_get_num, prop_set_num, NULL, &s->accel[i]);
++            object_property_add(OBJECT(s), gn[i], "number", prop_get_num, prop_set_num, NULL, &s->gyro[i]);
++        }
+     } else if (!strcmp(m, "rx8130")) {
+         s->model = M_RX8130;
+         s->regs[0x1E] = 0x00;
+-- 
+2.47.3
+

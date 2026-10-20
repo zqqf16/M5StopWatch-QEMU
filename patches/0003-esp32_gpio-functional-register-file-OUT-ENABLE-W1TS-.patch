@@ -1,0 +1,135 @@
+From e355a56128b3b94da9fb9e434dd596ba4ca1ecbb Mon Sep 17 00:00:00 2001
+From: M5StopWatch-QEMU <m5sw-qemu@local>
+Date: Tue, 20 Oct 2026 11:11:09 +0800
+Subject: [PATCH 3/4] esp32_gpio: functional register file, OUT/ENABLE
+ W1TS/W1TC, IN computed from outputs and external inputs, output listeners
+
+---
+ hw/gpio/esp32_gpio.c | 96 +++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 90 insertions(+), 6 deletions(-)
+
+diff --git a/hw/gpio/esp32_gpio.c b/hw/gpio/esp32_gpio.c
+index 4fea1f5..4a7faf2 100644
+--- a/hw/gpio/esp32_gpio.c
++++ b/hw/gpio/esp32_gpio.c
+@@ -18,27 +18,111 @@
+ #include "hw/irq.h"
+ #include "hw/qdev-properties.h"
+ #include "hw/gpio/esp32_gpio.h"
++#include "../m5stopwatch/m5stopwatch.h"
+ 
+ 
+ 
++/*
++ * Minimal functional GPIO model: register storage, OUT/ENABLE W1TS/W1TC,
++ * IN/IN1 computed from outputs and externally driven inputs (default: pulled up).
++ * Output-change listeners let board models observe e.g. software chip-selects.
++ */
++#define GPIO_NPINS 54
++static uint64_t g_ext_in = ~0ULL;      /* externally driven input levels */
++static uint32_t g_regs[0x200];         /* 0x000..0x7ff */
++static struct { esp32_gpio_out_cb cb; void *opaque; } g_listeners[GPIO_NPINS];
++
++void esp32_gpio_set_input(int pin, int level)
++{
++    if (pin < 0 || pin >= GPIO_NPINS) {
++        return;
++    }
++    if (level) {
++        g_ext_in |= 1ULL << pin;
++    } else {
++        g_ext_in &= ~(1ULL << pin);
++    }
++}
++
++void esp32_gpio_add_out_listener(int pin, esp32_gpio_out_cb cb, void *opaque)
++{
++    if (pin >= 0 && pin < GPIO_NPINS) {
++        g_listeners[pin].cb = cb;
++        g_listeners[pin].opaque = opaque;
++    }
++}
++
++static uint64_t gpio_out64(void)
++{
++    return (uint64_t)g_regs[0x04 / 4] | ((uint64_t)g_regs[0x10 / 4] << 32);
++}
++
++static uint64_t gpio_en64(void)
++{
++    return (uint64_t)g_regs[0x20 / 4] | ((uint64_t)g_regs[0x2c / 4] << 32);
++}
++
++static void gpio_notify(uint64_t before, uint64_t after)
++{
++    uint64_t diff = before ^ after;
++    for (int i = 0; diff && i < GPIO_NPINS; i++) {
++        if ((diff >> i) & 1) {
++            if (g_listeners[i].cb) {
++                g_listeners[i].cb(g_listeners[i].opaque, i, (after >> i) & 1);
++            }
++        }
++    }
++}
++
+ static uint64_t esp32_gpio_read(void *opaque, hwaddr addr, unsigned int size)
+ {
+     Esp32GpioState *s = ESP32_GPIO(opaque);
+-    uint64_t r = 0;
++    uint64_t en = gpio_en64();
++    uint64_t in = (gpio_out64() & en) | (g_ext_in & ~en);
+     switch (addr) {
+     case A_GPIO_STRAP:
+-        r = s->strap_mode;
+-        break;
+-
++        return s->strap_mode;
++    case 0x3c:
++        return (uint32_t)in;
++    case 0x40:
++        return (uint32_t)(in >> 32) & 0x3fffff;
++    case 0x08: case 0x0c: case 0x14: case 0x18:
++    case 0x24: case 0x28: case 0x30: case 0x34:
++        return 0;
+     default:
+-        break;
++        if (addr < sizeof(g_regs)) {
++            return g_regs[addr / 4];
++        }
++        return 0;
+     }
+-    return r;
+ }
+ 
+ static void esp32_gpio_write(void *opaque, hwaddr addr,
+                        uint64_t value, unsigned int size)
+ {
++    uint64_t before = gpio_out64();
++    switch (addr) {
++    case 0x08: g_regs[0x04 / 4] |= value; break;
++    case 0x0c: g_regs[0x04 / 4] &= ~value; break;
++    case 0x14: g_regs[0x10 / 4] |= value; break;
++    case 0x18: g_regs[0x10 / 4] &= ~value; break;
++    case 0x24: g_regs[0x20 / 4] |= value; break;
++    case 0x28: g_regs[0x20 / 4] &= ~value; break;
++    case 0x30: g_regs[0x2c / 4] |= value; break;
++    case 0x34: g_regs[0x2c / 4] &= ~value; break;
++    case 0x48: g_regs[0x44 / 4] |= value; break;
++    case 0x4c: g_regs[0x44 / 4] &= ~value; break;
++    case 0x54: g_regs[0x50 / 4] |= value; break;
++    case 0x58: g_regs[0x50 / 4] &= ~value; break;
++    case A_GPIO_STRAP: case 0x3c: case 0x40:
++        break;
++    default:
++        if (addr < sizeof(g_regs)) {
++            g_regs[addr / 4] = value;
++        }
++        break;
++    }
++    gpio_notify(before, gpio_out64());
+ }
+ 
+ static const MemoryRegionOps uart_ops = {
+-- 
+2.47.3
+

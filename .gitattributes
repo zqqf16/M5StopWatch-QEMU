@@ -1,0 +1,9 @@
+* text=auto eol=lf
+*.patch -text
+*.png binary
+*.bin binary
+*.dylib binary
+*.so* binary
+# If you decide to commit prebuilt binaries/firmware, track them with Git LFS:
+#   git lfs track "bin/**" "firmware/*.bin"
+# bin/** filter=lfs diff=lfs merge=lfs -text

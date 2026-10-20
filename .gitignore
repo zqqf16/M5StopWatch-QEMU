@@ -1,0 +1,16 @@
+# runtime state (flash images, sockets, logs, uploads)
+/run/
+/firmware/uploads/
+/firmware/*.bin
+!/firmware/uart-echo-test.bin
+# QEMU source checkout / build trees created by scripts/build-*.sh
+/build/
+/firmware/uart-echo-test/build/
+/firmware/uart-echo-test/sdkconfig
+/firmware/uart-echo-test/sdkconfig.old
+# prebuilt binaries are shipped in release archives, not in git
+/bin/*/
+/dist/
+__pycache__/
+*.pyc
+.DS_Store
