@@ -1,0 +1,247 @@
+From 0da768a6b29d0283c7e4c211ec421902d94fb2b2 Mon Sep 17 00:00:00 2001
+From: m5sw <m5sw@local>
+Date: Tue, 20 Oct 2026 17:49:04 +0800
+Subject: [PATCH 7/7] m5stopwatch: answer PHY and Wi-Fi MAC status polls
+
+Full RF calibration and MAC init busy-wait on bits that real silicon sets
+when a measurement finishes. Those registers were unmapped, so the first
+SoftAP start never returned and the panel stayed blank.
+---
+ hw/m5stopwatch/esp32s3_gpspi.c |   3 +
+ hw/m5stopwatch/esp32s3_rf.c    | 188 +++++++++++++++++++++++++++++++++
+ hw/m5stopwatch/m5stopwatch.h   |   2 +
+ hw/xtensa/meson.build          |   1 +
+ 4 files changed, 194 insertions(+)
+ create mode 100644 hw/m5stopwatch/esp32s3_rf.c
+
+diff --git a/hw/m5stopwatch/esp32s3_gpspi.c b/hw/m5stopwatch/esp32s3_gpspi.c
+index 418e161..09f02d3 100644
+--- a/hw/m5stopwatch/esp32s3_gpspi.c
++++ b/hw/m5stopwatch/esp32s3_gpspi.c
+@@ -273,4 +273,7 @@ void m5stopwatch_board_init(MemoryRegion *sys_mem, DeviceState *intmatrix,
+     DeviceState *panel = qdev_new(TYPE_CO5300);
+     qdev_realize_and_unref(panel, NULL, &error_fatal);
+     ss->panel = CO5300(panel);
++
++    /* PHY calibration polls RF status bits that are otherwise unmapped. */
++    m5stopwatch_rf_init(sys_mem);
+ }
+diff --git a/hw/m5stopwatch/esp32s3_rf.c b/hw/m5stopwatch/esp32s3_rf.c
+new file mode 100644
+index 0000000..a69b179
+--- /dev/null
++++ b/hw/m5stopwatch/esp32s3_rf.c
+@@ -0,0 +1,188 @@
++/*
++ * ESP32-S3 RF analog and front-end status stub.
++ *
++ * Full PHY calibration runs in the mask ROM and busy-waits until a SAR or IQ
++ * measurement reports done. No radio is modeled. The status bits those loops
++ * poll read back as finished, and the internal RF I2C master never stays busy.
++ * SAR samples are a fixed mid-scale code so the calibration math has a value.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#include "qemu/osdep.h"
++#include "exec/memory.h"
++#include "m5stopwatch.h"
++
++#define ANA_BASE 0x6000e000
++#define ANA_SIZE 0x200
++#define FE_BASE  0x60006000
++#define FE_SIZE  0x200
++#define SENS_BASE 0x60008800
++#define SENS_SIZE 0x400
++/* Wi-Fi MAC. hal_init writes MAC+0xd14 bit 1 and waits for bit 0. */
++#define MAC_BASE 0x60033000
++#define MAC_SIZE 0x2000
++
++typedef struct {
++    MemoryRegion ana;
++    MemoryRegion fe;
++    MemoryRegion sens;
++    MemoryRegion mac;
++    uint32_t ana_reg[ANA_SIZE / 4];
++    uint32_t fe_reg[FE_SIZE / 4];
++    uint32_t sens_reg[SENS_SIZE / 4];
++    uint32_t mac_reg[MAC_SIZE / 4];
++} M5RfState;
++
++static M5RfState rf_state;
++
++static uint32_t rf_load(uint32_t *regs, hwaddr addr, unsigned span)
++{
++    if ((addr & 3) || addr + 4 > span) {
++        return 0;
++    }
++    return regs[addr / 4];
++}
++
++static void rf_store(uint32_t *regs, hwaddr addr, unsigned span, uint32_t val)
++{
++    if ((addr & 3) || addr + 4 > span) {
++        return;
++    }
++    regs[addr / 4] = val;
++}
++
++static uint64_t ana_read(void *opaque, hwaddr addr, unsigned size)
++{
++    M5RfState *s = opaque;
++    uint32_t v = rf_load(s->ana_reg, addr, ANA_SIZE);
++
++    /* RF I2C command words. Bit 25 is busy; rom_chip_i2c_* waits for it to fall. */
++    if (addr == 0x00 || addr == 0x04) {
++        v &= ~(1u << 25);
++    }
++    /* Peak detector done: bits [26:24] == 7 (rom_pkdet_vol_start). */
++    if (addr == 0x50) {
++        v = (v & ~(7u << 24)) | (7u << 24);
++    }
++    /* TX DC calibration done (txdc_cal_v70 polls bit 24 of +0x4c). */
++    if (addr == 0x4c) {
++        v |= 1u << 24;
++    }
++    /* Frequency-update done (rom_phy_dis_hw_set_freq). */
++    if (addr == 0xc4) {
++        v |= 1u << 8;
++    }
++    /* SAR sample FIFO, eight 13-bit codes. */
++    if (addr >= 0x80 && addr < 0xa0 && (v & 0x1fff) == 0) {
++        v |= 0x0400;
++    }
++    return v;
++}
++
++static void ana_write(void *opaque, hwaddr addr, uint64_t data, unsigned size)
++{
++    rf_store(((M5RfState *)opaque)->ana_reg, addr, ANA_SIZE, data);
++}
++
++static uint64_t fe_read(void *opaque, hwaddr addr, unsigned size)
++{
++    M5RfState *s = opaque;
++    uint32_t v = rf_load(s->fe_reg, addr, FE_SIZE);
++
++    /* IQ estimate done (rom_iq_est_enable polls FE + 0x174 bit 16). */
++    if (addr == 0x174) {
++        v |= 1u << 16;
++    }
++    return v;
++}
++
++static void fe_write(void *opaque, hwaddr addr, uint64_t data, unsigned size)
++{
++    rf_store(((M5RfState *)opaque)->fe_reg, addr, FE_SIZE, data);
++}
++
++static uint64_t sens_read(void *opaque, hwaddr addr, unsigned size)
++{
++    M5RfState *s = opaque;
++    uint32_t v = rf_load(s->sens_reg, addr, SENS_SIZE);
++
++    /* temperature_sensor_get_raw_value starts a conversion at SENS+0x50 and
++     * waits for bit 8. Low 8 bits are the sample. */
++    if (addr == 0x50) {
++        v |= 1u << 8;
++        if ((v & 0xff) == 0) {
++            v |= 0x80;
++        }
++    }
++    return v;
++}
++
++static void sens_write(void *opaque, hwaddr addr, uint64_t data, unsigned size)
++{
++    rf_store(((M5RfState *)opaque)->sens_reg, addr, SENS_SIZE, data);
++}
++
++static uint64_t mac_read(void *opaque, hwaddr addr, unsigned size)
++{
++    M5RfState *s = opaque;
++    uint32_t v = rf_load(s->mac_reg, addr, MAC_SIZE);
++
++    /* hal_init: MAC+0xd14 bit 0 is the init-done flag. */
++    if (addr == 0xd14) {
++        v |= 1u;
++    }
++    return v;
++}
++
++static void mac_write(void *opaque, hwaddr addr, uint64_t data, unsigned size)
++{
++    rf_store(((M5RfState *)opaque)->mac_reg, addr, MAC_SIZE, data);
++}
++
++static const MemoryRegionOps ana_ops = {
++    .read = ana_read,
++    .write = ana_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++};
++
++static const MemoryRegionOps fe_ops = {
++    .read = fe_read,
++    .write = fe_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++};
++
++static const MemoryRegionOps sens_ops = {
++    .read = sens_read,
++    .write = sens_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++};
++
++static const MemoryRegionOps mac_ops = {
++    .read = mac_read,
++    .write = mac_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++};
++
++void m5stopwatch_rf_init(MemoryRegion *sys_mem)
++{
++    memory_region_init_io(&rf_state.ana, NULL, &ana_ops, &rf_state,
++                          "esp32s3.rf-ana", ANA_SIZE);
++    memory_region_add_subregion_overlap(sys_mem, ANA_BASE, &rf_state.ana, 1);
++    memory_region_init_io(&rf_state.fe, NULL, &fe_ops, &rf_state,
++                          "esp32s3.rf-fe", FE_SIZE);
++    memory_region_add_subregion_overlap(sys_mem, FE_BASE, &rf_state.fe, 1);
++    memory_region_init_io(&rf_state.sens, NULL, &sens_ops, &rf_state,
++                          "esp32s3.sens", SENS_SIZE);
++    memory_region_add_subregion_overlap(sys_mem, SENS_BASE, &rf_state.sens, 1);
++    memory_region_init_io(&rf_state.mac, NULL, &mac_ops, &rf_state,
++                          "esp32s3.wifi-mac", MAC_SIZE);
++    memory_region_add_subregion_overlap(sys_mem, MAC_BASE, &rf_state.mac, 1);
++}
+diff --git a/hw/m5stopwatch/m5stopwatch.h b/hw/m5stopwatch/m5stopwatch.h
+index 6ab919d..c3ff5a1 100644
+--- a/hw/m5stopwatch/m5stopwatch.h
++++ b/hw/m5stopwatch/m5stopwatch.h
+@@ -30,3 +30,5 @@ void m5sw_pwr_button(int pressed);
+ struct ESPGdmaState;
+ void m5stopwatch_board_init(MemoryRegion *sys_mem, DeviceState *intmatrix,
+                             struct ESPGdmaState *gdma);
++/* RF analog (0x6000E000) and FE (0x60006000) status bits for PHY calibration. */
++void m5stopwatch_rf_init(MemoryRegion *sys_mem);
+diff --git a/hw/xtensa/meson.build b/hw/xtensa/meson.build
+index f12c2ae..af23d90 100644
+--- a/hw/xtensa/meson.build
++++ b/hw/xtensa/meson.build
+@@ -16,6 +16,7 @@ xtensa_ss.add(when: 'CONFIG_XTENSA_ESP32S3', if_true: files(
+   '../m5stopwatch/esp32s3_gpspi.c',
+   '../m5stopwatch/co5300.c',
+   '../m5stopwatch/m5sw_i2c_devs.c',
++  '../m5stopwatch/esp32s3_rf.c',
+ ))
+ 
+ hw_arch += {'xtensa': xtensa_ss}
+-- 
+2.54.0
+
