@@ -1,0 +1,62 @@
+From 937bcc593f09248e14d043cf89e8ca348b492d64 Mon Sep 17 00:00:00 2001
+From: m5sw <m5sw@local>
+Date: Tue, 20 Oct 2026 17:49:04 +0800
+Subject: [PATCH 6/7] esp32s3_spi: scale SPI1 dummy phase by I/O width for
+ DIO/QIO reads
+
+USR_DUMMY_CYCLELEN counts clock cycles, but the flash model counts dummy
+bytes on the wire. A QIO read therefore swallowed the first two data
+bytes and shifted every runtime flash read, so SPIFFS rejected its magic.
+---
+ hw/ssi/esp32s3_spi.c | 24 +++++++++++++++++++++---
+ 1 file changed, 21 insertions(+), 3 deletions(-)
+
+diff --git a/hw/ssi/esp32s3_spi.c b/hw/ssi/esp32s3_spi.c
+index 90250e7..0506fa0 100644
+--- a/hw/ssi/esp32s3_spi.c
++++ b/hw/ssi/esp32s3_spi.c
+@@ -142,11 +142,11 @@ static void esp32s3_spi_txrx_buffer(ESP32S3SpiState *s,
+     int bytes = MAX(tx_bytes, rx_bytes);
+     for (int i = 0; i < bytes; ++i) {
+         uint8_t byte = 0;
+-        if (byte < tx_bytes) {
++        if (i < tx_bytes) {
+             memcpy(&byte, tx + i, 1);
+         }
+         uint32_t res = ssi_transfer(s->spi, byte);
+-        if (byte < rx_bytes) {
++        if (i < rx_bytes) {
+             memcpy(rx + i, &res, 1);
+         }
+     }
+@@ -222,8 +222,26 @@ static inline void esp32s3_spi_get_dummy(ESP32S3SpiState *s, uint32_t* len)
+      * 8 cycles = 1 byte
+      * 9 cycles = 2 bytes
+      * etc..
++     *
++     * USR_DUMMY_CYCLELEN holds the cycle count minus one. m25p80 counts dummy phases in bytes
++     * on the wire, so DIO/QIO cycles must be scaled by the number of data lines. ESP-IDF programs
++     * 6 dummy cycles (mode bits included) for an ISSI/Winbond QIO read: 24 bits = 3 bytes. Without
++     * the scale a QIO read clocks only 1 dummy byte and the flash model swallows the first 2 data
++     * bytes, shifting every runtime read by 2 (SPIFFS magic check fails with NOT_A_FS).
+      */
+-    *len = (dummy_count + 7) / 8;
++    uint32_t cycles = dummy_count + 1;
++    uint32_t lines = 1;
++    if (FIELD_EX32(s->mem_ctrl, SPI_MEM_CTRL, FREAD_QIO)) {
++        lines = 4;
++    } else if (FIELD_EX32(s->mem_ctrl, SPI_MEM_CTRL, FREAD_DIO)) {
++        lines = 2;
++    }
++    if (lines == 1) {
++        /* unchanged legacy rounding (also used by the octal PSRAM on CS1) */
++        *len = (dummy_count + 7) / 8;
++    } else {
++        *len = (cycles * lines + 7) / 8;
++    }
+ }
+ 
+ static void esp32s3_spi_begin_transaction(ESP32S3SpiState *s)
+-- 
+2.54.0
+
